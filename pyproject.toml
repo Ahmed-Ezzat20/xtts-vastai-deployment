@@ -1,0 +1,28 @@
+[project]
+name = "xtts-endpoint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9, <3.12"
+dependencies = [
+    "fastapi>=0.118.0",
+    "librosa>=0.10.0",
+    "numpy>=1.22.0",
+    "pydub>=0.25.1",
+    "scipy>=1.11.4",
+    "soundfile>=0.13.1",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "tts>=0.22.0",
+    "uvicorn>=0.37.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchaudio = [{ index = "pytorch-cu126" }]
+
