@@ -15,3 +15,5 @@ wheels/
 *.bin
 *.model
 *.json
+*.log
+.env

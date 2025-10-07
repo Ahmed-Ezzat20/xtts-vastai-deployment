@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import logging
+import time
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -14,14 +15,32 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
+import ngrok
+from contextlib import asynccontextmanager
+import os
+
+APPLICATION_PORT = 8000
+
+
+# --- App Configuration ---
+class Settings:
+    MODEL_DIR = os.getenv("MODEL_DIR", os.path.join(os.getcwd(), "checkpoint"))
+    DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ar")
+    DEFAULT_SR = int(os.getenv("DEFAULT_SR", "24000"))
+    SPEAKER_STORE = os.getenv("SPEAKER_STORE", os.path.join(os.getcwd(), "speakers"))
+    LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.getcwd(), "logs"))
+    MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
+    NGROK_DOMAIN = os.getenv("NGROK_DOMAIN")
+    NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN")
+
 
 # --- Production Logging Setup ---
-LOG_DIR = "/app/logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+settings = Settings()
+os.makedirs(settings.LOG_DIR, exist_ok=True)
 log_formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-log_file = os.path.join(LOG_DIR, "xtts_server.log")
+log_file = os.path.join(settings.LOG_DIR, "xtts_server.log")
 # Set up a rotating log handler to keep file sizes manageable
 handler = RotatingFileHandler(
     log_file, maxBytes=10 * 1024 * 1024, backupCount=5
@@ -32,22 +51,10 @@ logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
 
-# --- App Configuration ---
-class Settings:
-    MODEL_DIR = os.getenv("MODEL_DIR", "/checkpoint")
-    DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ar")
-    DEFAULT_SR = int(os.getenv("DEFAULT_SR", "24000"))
-    SPEAKER_STORE = os.getenv("SPEAKER_STORE", "/speakers")
-
-
-settings = Settings()
 os.makedirs(settings.SPEAKER_STORE, exist_ok=True)
 semaphore = asyncio.Semaphore(settings.MAX_CONCURRENCY)
 
-app = FastAPI(title="XTTS v2 Inference API", version="1.0.0")
 
-
-@app.on_event("startup")
 def load_model():
     config_path = os.path.join(settings.MODEL_DIR, "config.json")
     vocab_path = os.path.join(settings.MODEL_DIR, "vocab.json")
@@ -56,9 +63,11 @@ def load_model():
     if not os.path.exists(ckpt_path):
         raise RuntimeError(f"Model checkpoint not found at {ckpt_path}")
 
-    print(f"Loading model from {ckpt_path}")
+    logger.info(f"Loading model from {ckpt_path}")
+    t0 = time.perf_counter()
 
     config = XttsConfig()
+    config.kv_cache = True
     config.load_json(config_path)
 
     model = Xtts.init_from_config(config)
@@ -66,18 +75,54 @@ def load_model():
         config,
         checkpoint_dir=settings.MODEL_DIR,
         vocab_path=vocab_path,
-        use_deepspeed=False,
+        use_deepspeed=True,
+        eval=True,
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
 
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
     app.state.model = model
     app.state.config = config
     app.state.device = device
 
-    print(f"Model loaded successfully on {device}")
+    logger.info(f"Model loaded successfully on {device} (load_time={elapsed:.3f}s)")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    load_model()
+    if settings.NGROK_DOMAIN and settings.NGROK_AUTH_TOKEN:
+        try:
+            print(f"Setting up Ngrok Tunnel on {settings.NGROK_DOMAIN}")
+            print(
+                f"Using auth token: {settings.NGROK_AUTH_TOKEN[:4]}..."
+            )  # Only show first 4 chars for security
+            ngrok.set_auth_token(settings.NGROK_AUTH_TOKEN)
+            listener = await ngrok.connect(
+                addr=APPLICATION_PORT,
+                domain=settings.NGROK_DOMAIN,
+                authtoken=settings.NGROK_AUTH_TOKEN,
+            )
+            print(f"Ngrok tunnel established at: {listener.url()}")
+        except Exception as e:
+            print(f"Failed to establish ngrok tunnel: {str(e)}")
+    else:
+        print("Ngrok configuration not found. Skipping tunnel setup.")
+    yield
+    # Shutdown
+    try:
+        print("Tearing Down Ngrok Tunnel")
+        await ngrok.disconnect()
+    except Exception as e:
+        print(f"Error disconnecting ngrok: {str(e)}")
+
+
+app = FastAPI(title="XTTS v2 Inference API", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -148,13 +193,19 @@ async def tts_endpoint(req: TTSRequest):
 
         speaker_path = await resolve_speaker_path(req)
 
+        total_t0 = time.perf_counter()
         try:
+            # Conditioning (speaker embedding) timing
+            cond_t0 = time.perf_counter()
             gpt_cond_latent, speaker_embedding = (
                 app.state.model.get_conditioning_latents(audio_path=[speaker_path])
                 if speaker_path
                 else (None, None)
             )
+            cond_t1 = time.perf_counter()
 
+            # Inference timing
+            inf_t0 = time.perf_counter()
             with torch.no_grad():
                 out = app.state.model.inference(
                     text=req.text,
@@ -168,10 +219,46 @@ async def tts_endpoint(req: TTSRequest):
                 wav_np = out.get("wav")
                 if wav_np is None:
                     wav_np = out.get("audio")
+            inf_t1 = time.perf_counter()
 
+            # Ensure numpy array
             if isinstance(wav_np, torch.Tensor):
                 wav_np = wav_np.cpu().numpy()
 
+            # Calculate audio duration (seconds)
+            try:
+                num_samples = wav_np.shape[-1]
+                audio_duration = num_samples / float(req.sample_rate)
+            except Exception:
+                # Fallback: write to a buffer and use soundfile to inspect length
+                audio_duration = None
+
+            total_t1 = time.perf_counter()
+
+            cond_time = cond_t1 - cond_t0
+            inf_time = inf_t1 - inf_t0
+            total_time = total_t1 - total_t0
+
+            # Compute model speed metrics if we know audio duration
+            if audio_duration and audio_duration > 0:
+                samples_per_sec = (
+                    (num_samples / inf_time) if inf_time > 0 else float("inf")
+                )
+                rtf = total_time / audio_duration
+            else:
+                samples_per_sec = None
+                rtf = None
+
+            # Log timing summary (as formatted string so it appears in file formatter)
+            log_msg = (
+                f"TTS summary text_len={len(req.text)} "
+                f"cond_time_s={cond_time:.4f} inf_time_s={inf_time:.4f} total_time_s={total_time:.4f} "
+                f"audio_duration_s={round(audio_duration,4) if audio_duration else 'unknown'} "
+                f"samples_per_sec={round(samples_per_sec,2) if samples_per_sec else 'unknown'} rtf={round(rtf,4) if rtf else 'unknown'}"
+            )
+            logger.info(log_msg)
+
+            # Return audio
             wav_bytes = io.BytesIO()
             sf.write(wav_bytes, wav_np.astype("float32"), req.sample_rate, format="WAV")
             wav_bytes.seek(0)
@@ -184,6 +271,7 @@ async def tts_endpoint(req: TTSRequest):
             return StreamingResponse(wav_bytes, media_type="audio/wav")
 
         except Exception as e:
+            logger.exception("TTS inference failed")
             raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
 
