@@ -75,7 +75,7 @@ def load_model():
         config,
         checkpoint_dir=settings.MODEL_DIR,
         vocab_path=vocab_path,
-        use_deepspeed=True,
+        use_deepspeed=False,
         eval=True,
     )
 

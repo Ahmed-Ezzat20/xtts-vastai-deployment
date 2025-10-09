@@ -5,8 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.9, <3.12"
 dependencies = [
-    "deepspeed>=0.17.6",
     "fastapi>=0.118.0",
+    "gradio>=4.44.1",
     "huggingface-hub>=0.35.3",
     "librosa>=0.10.0",
     "ngrok>=1.4.0",
